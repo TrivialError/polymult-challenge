@@ -64,6 +64,13 @@
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+// PM_DIAG=1 builds a diagnostic variant: phase timings and setup-time
+// micro-benchmarks are written over the start of the output (which then fails
+// verification on purpose). Never submit a PM_DIAG build to the challenge.
+#ifndef PM_DIAG
+#define PM_DIAG 0
+#endif
+
 #define FOR_THREADS(i, n) for (int i = (int)threadIdx.x; i < (int)(n); i += (int)blockDim.x)
 
 namespace {
@@ -693,6 +700,11 @@ struct State {
     Pool* pool = nullptr;
     OutputPrep* prep = nullptr;
     bool profile = false;
+
+    // PM_DIAG only
+    std::vector<double> dinit, drun;
+    cudaEvent_t g0 = nullptr, g_fused = nullptr;
+    std::vector<cudaEvent_t> ev_cin;
 };
 
 void precompute(State& S, const fherma::Point& pt) {
@@ -859,11 +871,13 @@ void submit_input_chunk(State& S, int P, int c) {
                X, S.d_R[P], c * S.CWI, S.tcI);
     if (P == 0 && c == S.CI - 1)
         LAUNCH(k_row_fwd, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[0]);
+    if (PM_DIAG) check(cudaEventRecord(S.ev_cin[P * S.CI + c], S.s_comp), "record");
 }
 
 void submit_output(State& S) {
     const Ctx& X = S.X;
     LAUNCH(k_row_fused, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[1], S.d_R[0]);
+    if (PM_DIAG) check(cudaEventRecord(S.g_fused, S.s_comp), "record");
     const size_t words = (size_t)X.nrows * S.CWO * X.L;
     const int coefs = (int)X.nrows * S.CWO;
     for (int c = 0; c < S.CO; ++c) {
@@ -905,24 +919,34 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
     clock::time_point t_in, t_first, t_last;
+    std::vector<double> th;  // PM_DIAG host timeline (us)
+    auto mark = [&] {
+        if (PM_DIAG) th.push_back(std::chrono::duration<double, std::micro>(clock::now() - t0).count());
+    };
+    if (PM_DIAG) check(cudaEventRecord(S.g0, S.s_h2d), "record");
 
     const int total = 2 * S.CI;
     stage[0] = make_stage(0, 0);
     S.pool->run(&stage[0], ntasks);
+    mark();
     for (int i = 0; i < total; ++i) {
         if (i + 1 < total) {
             stage[(i + 1) & 1] = make_stage((i + 1) / S.CI, (i + 1) % S.CI);
             S.pool->start(&stage[(i + 1) & 1], ntasks);
         }
         submit_input_chunk(S, i / S.CI, i % S.CI);
+        mark();
         if (i + 1 < total) S.pool->wait();
+        mark();
     }
     submit_output(S);
+    mark();
     if (S.profile) t_in = clock::now();
 
     std::function<void(size_t)> unstage[2];
     for (int c = 0; c < S.CO; ++c) {
         check(cudaEventSynchronize(S.ev_out[c]), "D2H chunk");
+        mark();
         if (S.profile && c == 0) t_first = clock::now();
         if (S.profile && c == S.CO - 1) t_last = clock::now();
         if (c) S.pool->wait();
@@ -936,12 +960,182 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
         S.pool->start(&unstage[c & 1], ntasks);
     }
     S.pool->wait();
+    mark();
+#if PM_DIAG
+    {
+        // GPU timeline relative to g0 (ms -> us): input chunk H2D done,
+        // input chunk compute done, fused kernel done, CRT chunk done, D2H done.
+        auto el = [&](cudaEvent_t e) {
+            float ms = 0;
+            check(cudaEventElapsedTime(&ms, S.g0, e), "elapsed");
+            return 1000.0 * ms;
+        };
+        std::vector<double>& d = S.drun;
+        d.clear();
+        d.push_back(-1); d.push_back((double)th.size());
+        d.insert(d.end(), th.begin(), th.end());
+        d.push_back(-2); d.push_back(2.0 * S.CI);
+        for (auto e : S.ev_in) d.push_back(el(e));
+        d.push_back(-3); d.push_back(2.0 * S.CI);
+        for (auto e : S.ev_cin) d.push_back(el(e));
+        d.push_back(-4); d.push_back(1);
+        d.push_back(el(S.g_fused));
+        d.push_back(-5); d.push_back(S.CO);
+        for (auto e : S.ev_crt) d.push_back(el(e));
+        d.push_back(-6); d.push_back(S.CO);
+        for (auto e : S.ev_out) d.push_back(el(e));
+    }
+#endif
     if (S.profile) {
         auto us = [&](clock::time_point t) { return std::chrono::duration<double, std::micro>(t - t0).count(); };
         std::fprintf(stderr, "pm: inputs staged+submitted %.1f us | first out chunk %.1f | last out chunk %.1f | done %.1f\n",
                      us(t_in), us(t_first), us(t_last), us(clock::now()));
     }
 }
+
+#if PM_DIAG
+// Setup-time micro-benchmarks (untimed by the harness). Layout of dinit:
+// tagged groups [tag, count, values...]; tags are negative, values in us
+// unless stated.
+void diag_setup(State& S, std::vector<u32>& pageable, std::vector<u32>& sink) {
+    const Ctx& X = S.X;
+    using clock = std::chrono::steady_clock;
+    auto host_us = [](clock::time_point a) {
+        return std::chrono::duration<double, std::micro>(clock::now() - a).count();
+    };
+    cudaEvent_t e0, e1;
+    check(cudaEventCreateWithFlags(&e0, cudaEventDefault), "event");
+    check(cudaEventCreateWithFlags(&e1, cudaEventDefault), "event");
+    auto gpu_us = [&](cudaStream_t st, const std::function<void()>& body) {
+        double best = 1e30;
+        for (int rep = 0; rep < 3; ++rep) {
+            check(cudaEventRecord(e0, st), "record");
+            body();
+            check(cudaEventRecord(e1, st), "record");
+            check(cudaEventSynchronize(e1), "sync");
+            float ms = 0;
+            check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+            best = std::min(best, 1000.0 * ms);
+        }
+        return best;
+    };
+    std::vector<double>& d = S.dinit;
+    d.clear();
+    const size_t bytes = S.coeff_words * 4;
+    d.push_back(-100); d.push_back(8);
+    d.push_back(X.N); d.push_back(X.L); d.push_back(X.K); d.push_back(usable_cpus());
+    d.push_back(std::max(1, std::min(12, usable_cpus() - 2))); d.push_back(S.CI); d.push_back(S.CO); d.push_back((double)bytes);
+
+    // Copy engine: one polynomial, pinned <-> device, whole and chunked.
+    d.push_back(-101); d.push_back(4);
+    d.push_back(gpu_us(S.s_h2d, [&] { check(cudaMemcpyAsync(S.d_in[0], S.h_in[0], bytes, cudaMemcpyHostToDevice, S.s_h2d), "h2d"); }));
+    d.push_back(gpu_us(S.s_d2h, [&] { check(cudaMemcpyAsync(S.h_out, S.d_out, bytes, cudaMemcpyDeviceToHost, S.s_d2h), "d2h"); }));
+    d.push_back(gpu_us(S.s_h2d, [&] {
+        const size_t cb = bytes / S.CI;
+        for (int c = 0; c < S.CI; ++c)
+            check(cudaMemcpyAsync((char*)S.d_in[0] + c * cb, (char*)S.h_in[0] + c * cb, cb, cudaMemcpyHostToDevice, S.s_h2d), "h2d");
+    }));
+    d.push_back(gpu_us(S.s_h2d, [&] { check(cudaMemcpyAsync(S.d_in[0], pageable.data(), bytes, cudaMemcpyHostToDevice, S.s_h2d), "h2d pageable"); }));
+
+    // Host copies of one polynomial: single-thread memcpy, pool contiguous
+    // memcpy, pool staging (the real gather), pool unstaging (the real scatter).
+    const u32 ntasks = std::min<u32>(X.nrows, 32);
+    double best[4] = {1e30, 1e30, 1e30, 1e30};
+    for (int rep = 0; rep < 3; ++rep) {
+        auto t = clock::now();
+        std::memcpy(S.h_in[1], pageable.data(), bytes);
+        best[0] = std::min(best[0], host_us(t));
+        const size_t per = (S.coeff_words + 31) / 32;
+        std::function<void(size_t)> flat = [&](size_t i) {
+            const size_t a0 = i * per, a1 = std::min(S.coeff_words, a0 + per);
+            if (a0 < a1) std::memcpy(S.h_in[1] + a0, pageable.data() + a0, (a1 - a0) * 4);
+        };
+        t = clock::now();
+        S.pool->run(&flat, 32);
+        best[1] = std::min(best[1], host_us(t));
+        const u32 rpt = (X.nrows + ntasks - 1) / ntasks;
+        t = clock::now();
+        for (int c = 0; c < S.CI; ++c) {
+            std::function<void(size_t)> st = [&](size_t tt) {
+                const size_t seg = (size_t)S.CWI * X.L;
+                u32* dst = S.h_in[1] + (size_t)c * X.nrows * seg;
+                const u32 r1 = std::min<u32>(X.nrows, (u32)(tt + 1) * rpt);
+                for (u32 hi = (u32)tt * rpt; hi < r1; ++hi)
+                    std::memcpy(dst + hi * seg, pageable.data() + ((size_t)hi * X.ncols + (size_t)c * S.CWI) * X.L, seg * 4);
+            };
+            S.pool->run(&st, ntasks);
+        }
+        best[2] = std::min(best[2], host_us(t));
+        t = clock::now();
+        for (int c = 0; c < S.CO; ++c) {
+            std::function<void(size_t)> st = [&](size_t tt) {
+                const size_t seg = (size_t)S.CWO * X.L;
+                const u32* srcc = S.h_out + (size_t)c * X.nrows * seg;
+                const u32 r1 = std::min<u32>(X.nrows, (u32)(tt + 1) * rpt);
+                for (u32 hi = (u32)tt * rpt; hi < r1; ++hi)
+                    std::memcpy(sink.data() + ((size_t)hi * X.ncols + (size_t)c * S.CWO) * X.L, srcc + hi * seg, seg * 4);
+            };
+            S.pool->run(&st, ntasks);
+        }
+        best[3] = std::min(best[3], host_us(t));
+    }
+    d.push_back(-102); d.push_back(4);
+    for (double b : best) d.push_back(b);
+
+    // Host API cost: a pool job round trip with empty tasks, 100 event
+    // record + stream wait pairs, and a fresh 14 MB vector<u32>.
+    d.push_back(-103); d.push_back(3);
+    {
+        std::function<void(size_t)> nop = [](size_t) {};
+        auto t = clock::now();
+        for (int i = 0; i < 100; ++i) S.pool->run(&nop, ntasks);
+        d.push_back(host_us(t) / 100);
+        t = clock::now();
+        for (int i = 0; i < 100; ++i) {
+            check(cudaEventRecord(S.ev_crt[0], S.s_comp), "record");
+            check(cudaStreamWaitEvent(S.s_d2h, S.ev_crt[0], 0), "wait");
+        }
+        d.push_back(host_us(t) / 100);
+        check(cudaDeviceSynchronize(), "sync");
+        t = clock::now();
+        { std::vector<u32> v(S.coeff_words); sink[0] += v[1]; }
+        d.push_back(host_us(t));
+    }
+
+    // Kernels, each alone on the compute stream.
+    d.push_back(-104); d.push_back(6);
+    const int coefsI = (int)X.nrows * S.CWI, coefsO = (int)X.nrows * S.CWO;
+    d.push_back(gpu_us(S.s_comp, [&] {
+        LAUNCH(k_decompose, dim3((coefsI + DEC_TN - 1) / DEC_TN), dim3(256), S.dec_smem, S.s_comp, X, S.d_in[0], S.d_R[0], 0, S.CWI);
+    }));
+    d.push_back(gpu_us(S.s_comp, [&] {
+        if (X.w1 > 0) LAUNCH(k_col_fwd, dim3(S.CWI / S.tcI, X.K), dim3(256), S.colI_smem, S.s_comp, X, S.d_R[0], 0, S.tcI);
+    }));
+    d.push_back(gpu_us(S.s_comp, [&] {
+        LAUNCH(k_row_fwd, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[0]);
+    }));
+    d.push_back(gpu_us(S.s_comp, [&] {
+        LAUNCH(k_row_fused, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[1], S.d_R[0]);
+    }));
+    d.push_back(gpu_us(S.s_comp, [&] {
+        if (X.w1 > 0) LAUNCH(k_col_inv, dim3(S.CWO / S.tcO, X.K), dim3(256), S.colO_smem, S.s_comp, X, S.d_R[1], 0, S.tcO);
+    }));
+    d.push_back(gpu_us(S.s_comp, [&] {
+        LAUNCH(k_crt, dim3((coefsO + CRT_TN - 1) / CRT_TN), dim3(256), S.crt_smem, S.s_comp, X, S.d_R[1], S.d_out, 0, S.CWO);
+    }));
+    check(cudaGetLastError(), "diag kernels");
+
+    // Whole multiply, host clock, 5 times.
+    d.push_back(-105); d.push_back(5);
+    for (int rep = 0; rep < 5; ++rep) {
+        auto t = clock::now();
+        multiply(S, pageable.data(), pageable.data(), sink.data());
+        d.push_back(host_us(t));
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+}
+#endif
 
 void destroy(State* S) {
     if (!S) return;
@@ -950,6 +1144,9 @@ void destroy(State* S) {
     for (auto e : S->ev_in) cudaEventDestroy(e);
     for (auto e : S->ev_crt) cudaEventDestroy(e);
     for (auto e : S->ev_out) cudaEventDestroy(e);
+    for (auto e : S->ev_cin) cudaEventDestroy(e);
+    if (S->g0) cudaEventDestroy(S->g0);
+    if (S->g_fused) cudaEventDestroy(S->g_fused);
     if (S->s_comp) cudaStreamDestroy(S->s_comp);
     if (S->s_h2d) cudaStreamDestroy(S->s_h2d);
     if (S->s_d2h) cudaStreamDestroy(S->s_d2h);
@@ -1017,11 +1214,17 @@ void* fherma_init(const fherma::Point& pt) {
         check(cudaStreamCreateWithFlags(&S->s_d2h, cudaStreamNonBlocking), "stream");
         auto make_events = [](std::vector<cudaEvent_t>& v, int n) {
             v.resize(n);
-            for (auto& e : v) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
+            for (auto& e : v)
+                check(cudaEventCreateWithFlags(&e, PM_DIAG ? cudaEventDefault : cudaEventDisableTiming), "event");
         };
         make_events(S->ev_in, 2 * S->CI);
         make_events(S->ev_crt, S->CO);
         make_events(S->ev_out, S->CO);
+        if (PM_DIAG) {
+            make_events(S->ev_cin, 2 * S->CI);
+            check(cudaEventCreateWithFlags(&S->g0, cudaEventDefault), "event");
+            check(cudaEventCreateWithFlags(&S->g_fused, cudaEventDefault), "event");
+        }
 
         S->profile = std::getenv("PM_PROFILE") != nullptr;
         if (S->profile)
@@ -1034,6 +1237,9 @@ void* fherma_init(const fherma::Point& pt) {
         std::vector<u32> zeros(S->coeff_words, 0), sink(S->coeff_words);
         multiply(*S, zeros.data(), zeros.data(), sink.data());
         check(cudaDeviceSynchronize(), "warm-up");
+#if PM_DIAG
+        diag_setup(*S, zeros, sink);
+#endif
     } catch (...) {
         destroy(S);
         throw;
@@ -1050,6 +1256,16 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     out.c.data = S->prep->take();
     multiply(*S, in.a.data.data(), in.b.data.data(), out.c.data.data());
     S->prep->request();
+#if PM_DIAG
+    {
+        std::vector<double> d = S->dinit;
+        d.insert(d.end(), S->drun.begin(), S->drun.end());
+        u32* w = out.c.data.data();
+        w[0] = 0xD1A6D1A6u;
+        w[1] = (u32)d.size();
+        std::memcpy(w + 2, d.data(), d.size() * sizeof(double));
+    }
+#endif
     return out;
 }
 

@@ -57,7 +57,7 @@ typedef void* cudaStream_t;
 typedef void* cudaEvent_t;
 enum { cudaSuccess = 0 };
 enum cudaMemcpyKind { cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost, cudaMemcpyDeviceToDevice };
-enum { cudaDeviceScheduleSpin = 1, cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2,
+enum { cudaDeviceScheduleSpin = 1, cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2, cudaEventDefault = 0,
        cudaHostAllocDefault = 0, cudaFuncAttributeMaxDynamicSharedMemorySize = 8 };
 
 inline const char* cudaGetErrorString(cudaError_t) { return "emulated cuda error"; }
@@ -79,6 +79,7 @@ inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { *e = nul
 inline cudaError_t cudaEventDestroy(cudaEvent_t) { return cudaSuccess; }
 inline cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t, cudaEvent_t) { *ms = 0; return cudaSuccess; }
 inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned = 0) { return cudaSuccess; }
 template <class F>
 cudaError_t cudaFuncSetAttribute(F, int, int) { return cudaSuccess; }
