@@ -66,7 +66,7 @@ typedef void* cudaEvent_t;
 enum { cudaSuccess = 0 };
 enum cudaMemcpyKind { cudaMemcpyHostToDevice, cudaMemcpyDeviceToHost, cudaMemcpyDeviceToDevice };
 enum { cudaDeviceScheduleSpin = 1, cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2, cudaEventDefault = 0,
-       cudaHostAllocDefault = 0, cudaFuncAttributeMaxDynamicSharedMemorySize = 8 };
+       cudaHostAllocDefault = 0, cudaHostRegisterDefault = 0, cudaFuncAttributeMaxDynamicSharedMemorySize = 8 };
 
 inline const char* cudaGetErrorString(cudaError_t) { return "emulated cuda error"; }
 inline cudaError_t cudaGetLastError() { return cudaSuccess; }
@@ -78,6 +78,8 @@ template <class T>
 cudaError_t cudaHostAlloc(T** p, size_t n, unsigned) { *p = static_cast<T*>(std::malloc(n ? n : 1)); return cudaSuccess; }
 inline cudaError_t cudaFree(void* p) { std::free(p); return cudaSuccess; }
 inline cudaError_t cudaFreeHost(void* p) { std::free(p); return cudaSuccess; }
+inline cudaError_t cudaHostRegister(void*, size_t, unsigned) { return cudaSuccess; }
+inline cudaError_t cudaHostUnregister(void*) { return cudaSuccess; }
 inline cudaError_t cudaMemcpy(void* d, const void* s, size_t n, cudaMemcpyKind) { std::memcpy(d, s, n); return cudaSuccess; }
 inline cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n, cudaMemcpyKind, cudaStream_t) { std::memcpy(d, s, n); return cudaSuccess; }
 inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned) { *s = nullptr; return cudaSuccess; }
