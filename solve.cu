@@ -1258,12 +1258,25 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     S->prep->request();
 #if PM_DIAG
     {
+        // Large points keep no case files in a debug run, so the record also
+        // leaves as the case's crash note: call k throws slice k of the text.
         std::vector<double> d = S->dinit;
         d.insert(d.end(), S->drun.begin(), S->drun.end());
         u32* w = out.c.data.data();
         w[0] = 0xD1A6D1A6u;
         w[1] = (u32)d.size();
         std::memcpy(w + 2, d.data(), d.size() * sizeof(double));
+        std::string text;
+        char buf[32];
+        for (double v : d) {
+            std::snprintf(buf, sizeof buf, "%.0f ", v);
+            text += buf;
+        }
+        static int calls = 0;
+        const size_t slice = 180, nslices = (text.size() + slice - 1) / slice;
+        const size_t k = (size_t)(calls++) % nslices;
+        std::snprintf(buf, sizeof buf, "D%zu/%zu ", k, nslices);
+        throw std::runtime_error(buf + text.substr(k * slice, slice));
     }
 #endif
     return out;
