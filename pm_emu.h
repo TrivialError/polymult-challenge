@@ -35,6 +35,9 @@ alignas(16) inline unsigned char pm_emu_smem[1 << 20];
 #define __restrict__
 #define __align__(n)
 
+struct alignas(8) uint2 {
+    uint32_t x, y;
+};
 struct alignas(16) uint4 {
     uint32_t x, y, z, w;
 };
