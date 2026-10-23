@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Reassemble a PM_DIAG timing record from the crash notes of a FHERMA run and
+print it like diag_decode.py. Run with the fherma CLI's Python, which carries
+the API client and the stored login:
+
+    "<fherma venv>/bin/python" tests/fherma_notes.py <run id>
+"""
+import os
+import re
+import sys
+
+from fherma import config
+from fherma.api import Api
+
+sys.path.insert(0, os.path.dirname(__file__))
+from diag_decode import NAMES  # noqa: E402
+
+
+def main(run_id):
+    api = Api(config.load())
+    run = api._request("GET", "/runs/%s" % run_id)["run"]
+    slices = {}
+    for p in run["points"]:
+        for c in p["cases"]:
+            m = re.match(r"D(\d+)/(\d+) (.*)", c.get("note") or "", re.S)
+            if m:
+                slices[int(m.group(1))] = m.group(3)
+                total = int(m.group(2))
+    missing = [k for k in range(total) if k not in slices]
+    if missing:
+        print("missing slices", missing, "- values around them are unreliable")
+    text = "".join(slices.get(k, "") for k in range(total))
+    vals = [float(t) for t in text.split()]
+    i = 0
+    while i + 1 < len(vals):
+        tag, cnt = int(vals[i]), int(vals[i + 1])
+        if tag >= 0 or cnt < 0:
+            i += 1
+            continue
+        body = vals[i + 2:i + 2 + cnt]
+        title, labels = NAMES.get(tag, ("tag %d" % tag, None))
+        print("== " + title)
+        if labels:
+            for lab, v in zip(labels, body):
+                print("   %-28s %12.1f" % (lab, v))
+        else:
+            print("   " + " ".join("%.0f" % v for v in body))
+        i += 2 + cnt
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

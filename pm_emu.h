@@ -35,7 +35,12 @@ alignas(16) inline unsigned char pm_emu_smem[1 << 20];
 #define __restrict__
 #define __align__(n)
 
+struct alignas(16) uint4 {
+    uint32_t x, y, z, w;
+};
+
 inline void __syncthreads() {}
+inline int __clz(int x) { return x ? __builtin_clz((unsigned)x) : 32; }
 inline uint64_t __umul64hi(uint64_t a, uint64_t b) {
     return static_cast<uint64_t>((static_cast<unsigned __int128>(a) * b) >> 64);
 }

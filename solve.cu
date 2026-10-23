@@ -60,6 +60,9 @@
 #if defined(__linux__)
 #include <sched.h>
 #endif
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#endif
 
 typedef uint32_t u32;
 typedef uint64_t u64;
@@ -79,22 +82,24 @@ namespace {
 // Device side
 // ---------------------------------------------------------------------------
 
-constexpr int DEC_TN = 64;   // coefficients per decomposition block
-constexpr int CRT_TN = 32;   // coefficients per CRT block
-constexpr int COL_TC_MAX = 16;
+constexpr int DEC_TN = 16;   // coefficients per decomposition block
+constexpr int CRT_TN = 16;   // coefficients per CRT block
+constexpr int COL_TC_MAX = 8;
 constexpr int CHUNKS_IN = 8;    // column chunks per input polynomial
 constexpr int CHUNKS_OUT = 16;  // column chunks of the output
 
 struct Ctx {
     u32 N, nrows, ncols;
     int logN, w1, w2;
-    int K, KP, L, HP, ZL, W;
+    int K, KP, L, HP, ZL, W, TS;
     u64 delta;          // 2^W - q
     const u32* p;       // [KP] primes
     const u32* pinv;    // [KP] -p^-1 mod 2^32
     const u32* G;       // [KP] Montgomery form of N^-1 (M/p)^-1 2^32
     const float* rcp;   // [KP] 1/p
-    const u32* tw;      // [K][N] psi^bitrev(k) * 2^32 mod p
+    // Twiddles, Montgomery form, tw(k) = psi^bitrev_logN(k) 2^32 mod p:
+    const u32* tsmall;  // [K][TS]          tw(k) for k < TS = max(nrows, ncols)
+    const u32* trow;    // [K][w2][nrows]   tw(2^s + hi 2^(s-w1)), s = w1 + index
     const u32* cdec;    // [2L][KP] 2^(16h+32) mod p
     const u32* Qh;      // [K][HP] 16-bit halves of (M/p_j) mod q
     const u32* T;       // [K+1][L] (-v M) mod q
@@ -102,6 +107,7 @@ struct Ctx {
 };
 
 __device__ __forceinline__ int imin(int a, int b) { return a < b ? a : b; }
+__device__ __forceinline__ int ilog2(u32 x) { return 31 - __clz((int)x); }
 
 // t < p 2^32  ->  t 2^-32 mod p, canonical. p < 2^31.
 __device__ __forceinline__ u32 redc(u64 t, u32 p, u32 pinv) {
@@ -147,16 +153,17 @@ __global__ void k_decompose(Ctx X, const u32* __restrict__ in, u32* __restrict__
     }
     __syncthreads();
 
-    const int ngroups = DEC_TN / 4;
+    constexpr int ngroups = DEC_TN / 4;
     FOR_THREADS(task, ngroups * (X.KP / 4)) {
         const int ng = task % ngroups, jg = task / ngroups;
         u64 acc[4][4];
         for (int x = 0; x < 4; ++x)
             for (int y = 0; y < 4; ++y) acc[x][y] = 0;
+        const uint4* cd = reinterpret_cast<const uint4*>(X.cdec) + jg;
         for (int h = 0; h < H; ++h) {
-            u32 av[4], cv[4];
-            for (int x = 0; x < 4; ++x) av[x] = sh[h * DEC_TN + 4 * ng + x];
-            for (int y = 0; y < 4; ++y) cv[y] = X.cdec[h * X.KP + 4 * jg + y];
+            const uint4 a4 = *reinterpret_cast<const uint4*>(sh + h * DEC_TN + 4 * ng);
+            const uint4 c4 = cd[h * (X.KP / 4)];
+            const u32 av[4] = {a4.x, a4.y, a4.z, a4.w}, cv[4] = {c4.x, c4.y, c4.z, c4.w};
             for (int x = 0; x < 4; ++x)
                 for (int y = 0; y < 4; ++y) acc[x][y] += (u64)av[x] * cv[y];
         }
@@ -175,16 +182,18 @@ __global__ void k_decompose(Ctx X, const u32* __restrict__ in, u32* __restrict__
 
 // Forward stages s = 0 .. w1-1 (Cooley-Tukey, merged negacyclic twist) on a
 // tile of `tc` columns of prime blockIdx.y. Stage s pairs rows r and r + 2^(w1-1-s)
-// and uses tw[2^s + (n >> (logN - s))] = tw[2^s + (r >> (w1 - s))].
+// and uses tw(2^s + (n >> (logN - s))) = tw(2^s + (r >> (w1 - s))), all < nrows,
+// so the block's twiddles are staged in shared memory first.
 __global__ void k_col_fwd(Ctx X, u32* __restrict__ R, int col0, int tc) {
     DECLARE_SMEM;
-    u32* sh = reinterpret_cast<u32*>(smem_raw);  // [nrows][tc]
+    const int nr = (int)X.nrows;
+    u32* tws = reinterpret_cast<u32*>(smem_raw);  // [nrows]
+    u32* sh = tws + nr;                           // [nrows][tc]
     const int j = (int)blockIdx.y;
     const u32 p = X.p[j], pinv = X.pinv[j];
     u32* base = R + (size_t)j * X.N + col0 + (int)blockIdx.x * tc;
-    const u32* tw = X.tw + (size_t)j * X.N;
-    const int nr = (int)X.nrows;
 
+    FOR_THREADS(k, nr) tws[k] = X.tsmall[(size_t)j * X.TS + k];
     FOR_THREADS(idx, nr * tc) {
         const int r = idx / tc, cc = idx - r * tc;
         sh[idx] = base[(size_t)r * X.ncols + cc];
@@ -195,7 +204,7 @@ __global__ void k_col_fwd(Ctx X, u32* __restrict__ R, int col0, int tc) {
         FOR_THREADS(b, (nr / 2) * tc) {
             const int cc = b % tc, bi = b / tc;
             const int r1 = ((bi >> lt) << (lt + 1)) | (bi & (tr - 1));
-            const u32 w = tw[(1u << s) + ((u32)r1 >> (X.w1 - s))];
+            const u32 w = tws[(1u << s) + ((u32)r1 >> (X.w1 - s))];
             const u32 U = sh[r1 * tc + cc];
             const u32 V = mont_mul(sh[(r1 + tr) * tc + cc], w, p, pinv);
             sh[r1 * tc + cc] = add_mod(U, V, p);
@@ -211,16 +220,17 @@ __global__ void k_col_fwd(Ctx X, u32* __restrict__ R, int col0, int tc) {
 
 // Inverse (Gentleman-Sande) stages s = w1-1 .. 0 on a column tile. The inverse
 // twiddle psi^-bitrev(2^s + i) equals -psi^bitrev(2^s + 2^s - 1 - i), so the
-// forward table serves both directions: (U - V) psi^-e = (V - U) tw[...].
+// forward table serves both directions: (U - V) psi^-e = (V - U) tw(...).
 __global__ void k_col_inv(Ctx X, u32* __restrict__ R, int col0, int tc) {
     DECLARE_SMEM;
-    u32* sh = reinterpret_cast<u32*>(smem_raw);
+    const int nr = (int)X.nrows;
+    u32* tws = reinterpret_cast<u32*>(smem_raw);
+    u32* sh = tws + nr;
     const int j = (int)blockIdx.y;
     const u32 p = X.p[j], pinv = X.pinv[j];
     u32* base = R + (size_t)j * X.N + col0 + (int)blockIdx.x * tc;
-    const u32* tw = X.tw + (size_t)j * X.N;
-    const int nr = (int)X.nrows;
 
+    FOR_THREADS(k, nr) tws[k] = X.tsmall[(size_t)j * X.TS + k];
     FOR_THREADS(idx, nr * tc) {
         const int r = idx / tc, cc = idx - r * tc;
         sh[idx] = base[(size_t)r * X.ncols + cc];
@@ -232,7 +242,7 @@ __global__ void k_col_inv(Ctx X, u32* __restrict__ R, int col0, int tc) {
             const int cc = b % tc, bi = b / tc;
             const int r1 = ((bi >> lt) << (lt + 1)) | (bi & (tr - 1));
             const u32 i = (u32)r1 >> (X.w1 - s);
-            const u32 w = tw[(1u << s) + ((1u << s) - 1u - i)];
+            const u32 w = tws[(1u << s) + ((1u << s) - 1u - i)];
             const u32 U = sh[r1 * tc + cc];
             const u32 V = sh[(r1 + tr) * tc + cc];
             sh[r1 * tc + cc] = add_mod(U, V, p);
@@ -246,15 +256,27 @@ __global__ void k_col_inv(Ctx X, u32* __restrict__ R, int col0, int tc) {
     }
 }
 
-// Forward stages s = w1 .. logN-1 on a single contiguous row (blockIdx.x) of
-// prime blockIdx.y, in shared memory `sh`.
-__device__ __forceinline__ void row_forward(const Ctx& X, u32* sh, const u32* tw, u32 rowbase,
-                                            u32 p, u32 pinv) {
+// The twiddles one row needs, in shared memory. Row stage s (s >= w1) of row hi
+// uses tw(2^s + hi 2^sl + x) with sl = s - w1, x < 2^sl. Those bit fields are
+// disjoint, so the exponent bitrev(.) splits into a sum and
+//     tw(2^s + hi 2^sl + x) = tw(2^s + hi 2^sl) * psi^bitrev(x) = trow * tsmall,
+// one Montgomery product. rt[2^sl + x] holds it, indices 1 .. ncols-1.
+__device__ __forceinline__ void row_twiddles(const Ctx& X, u32* rt, int j, u32 hi, u32 p, u32 pinv) {
+    const u32* tr = X.trow + (size_t)j * X.w2 * X.nrows;
+    const u32* ts = X.tsmall + (size_t)j * X.TS;
+    FOR_THREADS(idx, (int)X.ncols - 1) {
+        const int k = idx + 1, sl = ilog2((u32)k);
+        rt[k] = mont_mul(tr[sl * X.nrows + hi], ts[k - (1 << sl)], p, pinv);
+    }
+}
+
+// Forward stages s = w1 .. logN-1 on one contiguous row held in `sh`.
+__device__ __forceinline__ void row_forward(const Ctx& X, u32* sh, const u32* rt, u32 p, u32 pinv) {
     for (int s = X.w1; s < X.logN; ++s) {
-        const int lt = X.logN - 1 - s, t = 1 << lt;
+        const int lt = X.logN - 1 - s, t = 1 << lt, sl = s - X.w1;
         FOR_THREADS(b, (int)X.ncols / 2) {
             const int x1 = ((b >> lt) << (lt + 1)) | (b & (t - 1));
-            const u32 w = tw[(1u << s) + ((rowbase + (u32)x1) >> (X.logN - s))];
+            const u32 w = rt[(1u << sl) + ((u32)x1 >> (X.logN - s))];
             const u32 U = sh[x1];
             const u32 V = mont_mul(sh[x1 + t], w, p, pinv);
             sh[x1] = add_mod(U, V, p);
@@ -264,14 +286,16 @@ __device__ __forceinline__ void row_forward(const Ctx& X, u32* sh, const u32* tw
     }
 }
 
-__device__ __forceinline__ void row_inverse(const Ctx& X, u32* sh, const u32* tw, u32 rowbase,
-                                            u32 p, u32 pinv) {
+// Inverse row stages of row hi. The mirrored index 2^s - 1 - (hi 2^sl + x)
+// equals (nrows-1-hi) 2^sl + (2^sl - 1 - x), so `rti` is row_twiddles of row
+// nrows-1-hi read backwards within each stage.
+__device__ __forceinline__ void row_inverse(const Ctx& X, u32* sh, const u32* rti, u32 p, u32 pinv) {
     for (int s = X.logN - 1; s >= X.w1; --s) {
-        const int lt = X.logN - 1 - s, t = 1 << lt;
+        const int lt = X.logN - 1 - s, t = 1 << lt, sl = s - X.w1;
         FOR_THREADS(b, (int)X.ncols / 2) {
             const int x1 = ((b >> lt) << (lt + 1)) | (b & (t - 1));
-            const u32 i = (rowbase + (u32)x1) >> (X.logN - s);
-            const u32 w = tw[(1u << s) + ((1u << s) - 1u - i)];
+            const u32 x = (u32)x1 >> (X.logN - s);
+            const u32 w = rti[(1u << sl) + ((1u << sl) - 1u - x)];
             const u32 U = sh[x1];
             const u32 V = sh[x1 + t];
             sh[x1] = add_mod(U, V, p);
@@ -283,16 +307,17 @@ __device__ __forceinline__ void row_inverse(const Ctx& X, u32* sh, const u32* tw
 
 __global__ void k_row_fwd(Ctx X, u32* __restrict__ R) {
     DECLARE_SMEM;
-    u32* sh = reinterpret_cast<u32*>(smem_raw);  // [ncols]
+    u32* rt = reinterpret_cast<u32*>(smem_raw);  // [ncols]
+    u32* sh = rt + X.ncols;                      // [ncols]
     const int j = (int)blockIdx.y;
     const u32 p = X.p[j], pinv = X.pinv[j];
-    const u32 rowbase = (u32)blockIdx.x * X.ncols;
-    u32* row = R + (size_t)j * X.N + rowbase;
-    const u32* tw = X.tw + (size_t)j * X.N;
+    const u32 hi = blockIdx.x;
+    u32* row = R + (size_t)j * X.N + (size_t)hi * X.ncols;
 
+    row_twiddles(X, rt, j, hi, p, pinv);
     FOR_THREADS(x, X.ncols) sh[x] = row[x];
     __syncthreads();
-    row_forward(X, sh, tw, rowbase, p, pinv);
+    row_forward(X, sh, rt, p, pinv);
     FOR_THREADS(x, X.ncols) row[x] = sh[x];
 }
 
@@ -300,20 +325,24 @@ __global__ void k_row_fwd(Ctx X, u32* __restrict__ R) {
 // (Montgomery: introduces 2^-32, compensated in G), inverse row stages.
 __global__ void k_row_fused(Ctx X, u32* __restrict__ RB, const u32* __restrict__ RA) {
     DECLARE_SMEM;
-    u32* sh = reinterpret_cast<u32*>(smem_raw);
+    u32* rt = reinterpret_cast<u32*>(smem_raw);  // [ncols] forward twiddles, row hi
+    u32* rti = rt + X.ncols;                     // [ncols] row nrows-1-hi, for the inverse
+    u32* sh = rti + X.ncols;                     // [ncols]
     const int j = (int)blockIdx.y;
     const u32 p = X.p[j], pinv = X.pinv[j];
-    const u32 rowbase = (u32)blockIdx.x * X.ncols;
-    u32* row = RB + (size_t)j * X.N + rowbase;
-    const u32* arow = RA + (size_t)j * X.N + rowbase;
-    const u32* tw = X.tw + (size_t)j * X.N;
+    const u32 hi = blockIdx.x;
+    const size_t off = (size_t)j * X.N + (size_t)hi * X.ncols;
+    u32* row = RB + off;
+    const u32* arow = RA + off;
 
+    row_twiddles(X, rt, j, hi, p, pinv);
+    row_twiddles(X, rti, j, X.nrows - 1 - hi, p, pinv);
     FOR_THREADS(x, X.ncols) sh[x] = row[x];
     __syncthreads();
-    row_forward(X, sh, tw, rowbase, p, pinv);
+    row_forward(X, sh, rt, p, pinv);
     FOR_THREADS(x, X.ncols) sh[x] = mont_mul(sh[x], arow[x], p, pinv);
     __syncthreads();
-    row_inverse(X, sh, tw, rowbase, p, pinv);
+    row_inverse(X, sh, rti, p, pinv);
     FOR_THREADS(x, X.ncols) row[x] = sh[x];
 }
 
@@ -347,16 +376,17 @@ __global__ void k_crt(Ctx X, const u32* __restrict__ R, u32* __restrict__ out, i
         sh_v[pos] = (u32)(s + 0.5f);
     }
     // acc[pos][h] = sum_j y_j * Qh[j][h]  (< K 2^47).
-    const int ngroups = CRT_TN / 4;
+    constexpr int ngroups = CRT_TN / 4;
     FOR_THREADS(task, ngroups * (HP / 4)) {
         const int ng = task % ngroups, hg = task / ngroups;
         u64 acc[4][4];
         for (int x = 0; x < 4; ++x)
             for (int y = 0; y < 4; ++y) acc[x][y] = 0;
+        const uint4* qh = reinterpret_cast<const uint4*>(X.Qh) + hg;
         for (int j = 0; j < K; ++j) {
-            u32 yv[4], qv[4];
-            for (int x = 0; x < 4; ++x) yv[x] = sh_y[j * CRT_TN + 4 * ng + x];
-            for (int y = 0; y < 4; ++y) qv[y] = X.Qh[j * HP + 4 * hg + y];
+            const uint4 y4 = *reinterpret_cast<const uint4*>(sh_y + j * CRT_TN + 4 * ng);
+            const uint4 q4 = qh[j * (HP / 4)];
+            const u32 yv[4] = {y4.x, y4.y, y4.z, y4.w}, qv[4] = {q4.x, q4.y, q4.z, q4.w};
             for (int x = 0; x < 4; ++x)
                 for (int y = 0; y < 4; ++y) acc[x][y] += (u64)yv[x] * qv[y];
         }
@@ -658,6 +688,27 @@ class OutputPrep {
     std::thread thread_;
 };
 
+// Host copies between the caller's buffers and pinned staging. Non-temporal
+// stores skip the read-for-ownership of the destination, so a copy moves 2x
+// rather than 3x its size over the memory bus, which the concurrent DMA shares.
+// Call stream_fence() before handing the destination to anyone else.
+inline void stream_copy(void* dst, const void* src, size_t bytes) {
+#if defined(__x86_64__)
+    if (((uintptr_t)dst & 15) == 0 && (bytes & 15) == 0) {
+        __m128i* d = static_cast<__m128i*>(dst);
+        const __m128i* sp = static_cast<const __m128i*>(src);
+        for (size_t i = 0, n = bytes / 16; i < n; ++i) _mm_stream_si128(d + i, _mm_loadu_si128(sp + i));
+        return;
+    }
+#endif
+    std::memcpy(dst, src, bytes);
+}
+inline void stream_fence() {
+#if defined(__x86_64__)
+    _mm_sfence();
+#endif
+}
+
 int usable_cpus() {
 #if defined(__linux__)
     cpu_set_t set;
@@ -685,7 +736,7 @@ T* dev_upload(const std::vector<T>& v) {
 struct State {
     Ctx X{};
     int CI = 1, CWI = 1, CO = 1, CWO = 1, tcI = 1, tcO = 1, row_threads = 32;
-    size_t dec_smem = 0, crt_smem = 0, colI_smem = 0, colO_smem = 0, row_smem = 0;
+    size_t dec_smem = 0, crt_smem = 0, colI_smem = 0, colO_smem = 0, row_smem = 0, fused_smem = 0;
     size_t coeff_words = 0;  // N * L
 
     std::vector<void*> dev_tables;
@@ -765,11 +816,12 @@ void precompute(State& S, const fherma::Point& pt) {
     X.HP = (2 * L + 3) & ~3;
     X.ZL = std::max(L + 4, 6);
     X.W = W;
+    X.TS = (int)std::max(X.nrows, X.ncols);
 
-    const int KP = X.KP, HP = X.HP;
+    const int KP = X.KP, HP = X.HP, TS = X.TS;
     std::vector<u32> hp(KP, 1), hpinv(KP, 0), hG(KP, 0), hcdec((size_t)2 * L * KP, 0);
     std::vector<float> hrcp(KP, 0.f);
-    std::vector<u32> htw((size_t)K * N);
+    std::vector<u32> htsmall((size_t)K * TS), htrow((size_t)K * X.w2 * X.nrows);
     std::vector<u32> pw(N);
     for (int j = 0; j < K; ++j) {
         const u32 p = primes[j];
@@ -786,12 +838,15 @@ void precompute(State& S, const fherma::Point& pt) {
         }
         pw[0] = 1;
         for (u32 e = 1; e < N; ++e) pw[e] = (u32)((u64)pw[e - 1] * psi % p);
-        u32* tw = htw.data() + (size_t)j * N;
-        for (u32 k = 0; k < N; ++k) {
+        auto tw = [&](u32 k) {  // psi^bitrev_logN(k) in Montgomery form
             u32 r = 0;
             for (int b = 0; b < logN; ++b) r |= ((k >> b) & 1u) << (logN - 1 - b);
-            tw[k] = (u32)(((u64)pw[r] << 32) % p);
-        }
+            return (u32)(((u64)pw[r] << 32) % p);
+        };
+        for (int k = 0; k < TS; ++k) htsmall[(size_t)j * TS + k] = tw((u32)k);
+        for (int sl = 0; sl < X.w2; ++sl)
+            for (u32 hi = 0; hi < X.nrows; ++hi)
+                htrow[((size_t)j * X.w2 + sl) * X.nrows + hi] = tw((1u << (X.w1 + sl)) + (hi << sl));
 
         u64 mp = 1;  // (M / p_j) mod p_j
         for (int i = 0; i < K; ++i)
@@ -848,7 +903,8 @@ void precompute(State& S, const fherma::Point& pt) {
     X.pinv = keep(dev_upload(hpinv));
     X.G = keep(dev_upload(hG));
     X.rcp = keep(dev_upload(hrcp));
-    X.tw = keep(dev_upload(htw));
+    X.tsmall = keep(dev_upload(htsmall));
+    X.trow = keep(dev_upload(htrow));
     X.cdec = keep(dev_upload(hcdec));
     X.Qh = keep(dev_upload(hQh));
     X.T = keep(dev_upload(hT));
@@ -864,7 +920,7 @@ void submit_input_chunk(State& S, int P, int c) {
     check(cudaEventRecord(ev, S.s_h2d), "record");
     check(cudaStreamWaitEvent(S.s_comp, ev, 0), "wait");
     const int coefs = (int)X.nrows * S.CWI;
-    LAUNCH(k_decompose, dim3((coefs + DEC_TN - 1) / DEC_TN), dim3(256), S.dec_smem, S.s_comp,
+    LAUNCH(k_decompose, dim3((coefs + DEC_TN - 1) / DEC_TN), dim3(128), S.dec_smem, S.s_comp,
            X, S.d_in[P] + off, S.d_R[P], c, S.CWI);
     if (X.w1 > 0)
         LAUNCH(k_col_fwd, dim3(S.CWI / S.tcI, X.K), dim3(256), S.colI_smem, S.s_comp,
@@ -876,7 +932,7 @@ void submit_input_chunk(State& S, int P, int c) {
 
 void submit_output(State& S) {
     const Ctx& X = S.X;
-    LAUNCH(k_row_fused, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[1], S.d_R[0]);
+    LAUNCH(k_row_fused, dim3(X.nrows, X.K), dim3(S.row_threads), S.fused_smem, S.s_comp, X, S.d_R[1], S.d_R[0]);
     if (PM_DIAG) check(cudaEventRecord(S.g_fused, S.s_comp), "record");
     const size_t words = (size_t)X.nrows * S.CWO * X.L;
     const int coefs = (int)X.nrows * S.CWO;
@@ -885,7 +941,7 @@ void submit_output(State& S) {
         if (X.w1 > 0)
             LAUNCH(k_col_inv, dim3(S.CWO / S.tcO, X.K), dim3(256), S.colO_smem, S.s_comp,
                    X, S.d_R[1], c * S.CWO, S.tcO);
-        LAUNCH(k_crt, dim3((coefs + CRT_TN - 1) / CRT_TN), dim3(256), S.crt_smem, S.s_comp,
+        LAUNCH(k_crt, dim3((coefs + CRT_TN - 1) / CRT_TN), dim3(128), S.crt_smem, S.s_comp,
                X, S.d_R[1], S.d_out + off, c, S.CWO);
         check(cudaEventRecord(S.ev_crt[c], S.s_comp), "record");
         check(cudaStreamWaitEvent(S.s_d2h, S.ev_crt[c], 0), "wait");
@@ -912,7 +968,8 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
             u32* dst = S.h_in[P] + (size_t)c * nrows * seg;
             const u32 r1 = std::min<u32>(nrows, (u32)(t + 1) * rpt);
             for (u32 hi = (u32)t * rpt; hi < r1; ++hi)
-                std::memcpy(dst + hi * seg, src[P] + ((size_t)hi * ncols + (size_t)c * S.CWI) * L, seg * 4);
+                stream_copy(dst + hi * seg, src[P] + ((size_t)hi * ncols + (size_t)c * S.CWI) * L, seg * 4);
+            stream_fence();
         };
     };
 
@@ -955,7 +1012,8 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
             const u32* srcc = S.h_out + (size_t)c * nrows * seg;
             const u32 r1 = std::min<u32>(nrows, (u32)(t + 1) * rpt);
             for (u32 hi = (u32)t * rpt; hi < r1; ++hi)
-                std::memcpy(out + ((size_t)hi * ncols + (size_t)c * S.CWO) * L, srcc + hi * seg, seg * 4);
+                stream_copy(out + ((size_t)hi * ncols + (size_t)c * S.CWO) * L, srcc + hi * seg, seg * 4);
+            stream_fence();
         };
         S.pool->start(&unstage[c & 1], ntasks);
     }
@@ -1102,11 +1160,73 @@ void diag_setup(State& S, std::vector<u32>& pageable, std::vector<u32>& sink) {
         d.push_back(host_us(t));
     }
 
+    // DMA under host-copy load: H2D of one poly (pinned) while the pool copies
+    // another poly pageable -> pinned, with {memcpy, streaming} x {32 tasks, 6 tasks}.
+    // Pairs (DMA us, host copy us); then a streaming gather and scatter alone.
+    d.push_back(-106); d.push_back(10);
+    for (int mode = 0; mode < 2; ++mode)
+        for (int nt : {32, 6}) {
+            const size_t per = (S.coeff_words + nt - 1) / nt;
+            std::function<void(size_t)> job = [&](size_t i) {
+                const size_t a0 = i * per, a1 = std::min(S.coeff_words, a0 + per);
+                if (a0 >= a1) return;
+                if (mode) { stream_copy(S.h_in[1] + a0, pageable.data() + a0, (a1 - a0) * 4); stream_fence(); }
+                else std::memcpy(S.h_in[1] + a0, pageable.data() + a0, (a1 - a0) * 4);
+            };
+            double bd = 1e30, bh = 1e30;
+            for (int rep = 0; rep < 3; ++rep) {
+                check(cudaEventRecord(e0, S.s_h2d), "record");
+                check(cudaMemcpyAsync(S.d_in[0], S.h_in[0], bytes, cudaMemcpyHostToDevice, S.s_h2d), "h2d");
+                check(cudaEventRecord(e1, S.s_h2d), "record");
+                auto t = clock::now();
+                S.pool->run(&job, (u32)nt);
+                bh = std::min(bh, host_us(t));
+                check(cudaEventSynchronize(e1), "sync");
+                float ms = 0;
+                check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+                bd = std::min(bd, 1000.0 * ms);
+            }
+            d.push_back(bd); d.push_back(bh);
+        }
+    {
+        const u32 rpt = (X.nrows + ntasks - 1) / ntasks;
+        double bg = 1e30, bs = 1e30;
+        for (int rep = 0; rep < 3; ++rep) {
+            auto t = clock::now();
+            for (int c = 0; c < S.CI; ++c) {
+                std::function<void(size_t)> st = [&](size_t tt) {
+                    const size_t seg = (size_t)S.CWI * X.L;
+                    u32* dst = S.h_in[1] + (size_t)c * X.nrows * seg;
+                    const u32 r1 = std::min<u32>(X.nrows, (u32)(tt + 1) * rpt);
+                    for (u32 hi = (u32)tt * rpt; hi < r1; ++hi)
+                        stream_copy(dst + hi * seg, pageable.data() + ((size_t)hi * X.ncols + (size_t)c * S.CWI) * X.L, seg * 4);
+                    stream_fence();
+                };
+                S.pool->run(&st, ntasks);
+            }
+            bg = std::min(bg, host_us(t));
+            t = clock::now();
+            for (int c = 0; c < S.CO; ++c) {
+                std::function<void(size_t)> st = [&](size_t tt) {
+                    const size_t seg = (size_t)S.CWO * X.L;
+                    const u32* srcc = S.h_out + (size_t)c * X.nrows * seg;
+                    const u32 r1 = std::min<u32>(X.nrows, (u32)(tt + 1) * rpt);
+                    for (u32 hi = (u32)tt * rpt; hi < r1; ++hi)
+                        stream_copy(sink.data() + ((size_t)hi * X.ncols + (size_t)c * S.CWO) * X.L, srcc + hi * seg, seg * 4);
+                    stream_fence();
+                };
+                S.pool->run(&st, ntasks);
+            }
+            bs = std::min(bs, host_us(t));
+        }
+        d.push_back(bg); d.push_back(bs);
+    }
+
     // Kernels, each alone on the compute stream.
     d.push_back(-104); d.push_back(6);
     const int coefsI = (int)X.nrows * S.CWI, coefsO = (int)X.nrows * S.CWO;
     d.push_back(gpu_us(S.s_comp, [&] {
-        LAUNCH(k_decompose, dim3((coefsI + DEC_TN - 1) / DEC_TN), dim3(256), S.dec_smem, S.s_comp, X, S.d_in[0], S.d_R[0], 0, S.CWI);
+        LAUNCH(k_decompose, dim3((coefsI + DEC_TN - 1) / DEC_TN), dim3(128), S.dec_smem, S.s_comp, X, S.d_in[0], S.d_R[0], 0, S.CWI);
     }));
     d.push_back(gpu_us(S.s_comp, [&] {
         if (X.w1 > 0) LAUNCH(k_col_fwd, dim3(S.CWI / S.tcI, X.K), dim3(256), S.colI_smem, S.s_comp, X, S.d_R[0], 0, S.tcI);
@@ -1115,13 +1235,13 @@ void diag_setup(State& S, std::vector<u32>& pageable, std::vector<u32>& sink) {
         LAUNCH(k_row_fwd, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[0]);
     }));
     d.push_back(gpu_us(S.s_comp, [&] {
-        LAUNCH(k_row_fused, dim3(X.nrows, X.K), dim3(S.row_threads), S.row_smem, S.s_comp, X, S.d_R[1], S.d_R[0]);
+        LAUNCH(k_row_fused, dim3(X.nrows, X.K), dim3(S.row_threads), S.fused_smem, S.s_comp, X, S.d_R[1], S.d_R[0]);
     }));
     d.push_back(gpu_us(S.s_comp, [&] {
         if (X.w1 > 0) LAUNCH(k_col_inv, dim3(S.CWO / S.tcO, X.K), dim3(256), S.colO_smem, S.s_comp, X, S.d_R[1], 0, S.tcO);
     }));
     d.push_back(gpu_us(S.s_comp, [&] {
-        LAUNCH(k_crt, dim3((coefsO + CRT_TN - 1) / CRT_TN), dim3(256), S.crt_smem, S.s_comp, X, S.d_R[1], S.d_out, 0, S.CWO);
+        LAUNCH(k_crt, dim3((coefsO + CRT_TN - 1) / CRT_TN), dim3(128), S.crt_smem, S.s_comp, X, S.d_R[1], S.d_out, 0, S.CWO);
     }));
     check(cudaGetLastError(), "diag kernels");
 
@@ -1184,9 +1304,10 @@ void* fherma_init(const fherma::Point& pt) {
 
         S->dec_smem = (size_t)2 * X.L * DEC_TN * 4;
         S->crt_smem = (size_t)CRT_TN * X.HP * 8 + (size_t)X.KP * CRT_TN * 4 + (size_t)CRT_TN * X.ZL * 4 + CRT_TN * 4;
-        S->colI_smem = (size_t)X.nrows * S->tcI * 4;
-        S->colO_smem = (size_t)X.nrows * S->tcO * 4;
-        S->row_smem = (size_t)X.ncols * 4;
+        S->colI_smem = (size_t)X.nrows * (S->tcI + 1) * 4;
+        S->colO_smem = (size_t)X.nrows * (S->tcO + 1) * 4;
+        S->row_smem = (size_t)X.ncols * 2 * 4;
+        S->fused_smem = (size_t)X.ncols * 3 * 4;
         auto allow = [](auto kernel, size_t bytes) {
             if (bytes > 48 * 1024)
                 check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
@@ -1197,7 +1318,7 @@ void* fherma_init(const fherma::Point& pt) {
         allow(k_col_fwd, S->colI_smem);
         allow(k_col_inv, S->colO_smem);
         allow(k_row_fwd, S->row_smem);
-        allow(k_row_fused, S->row_smem);
+        allow(k_row_fused, S->fused_smem);
 
         const size_t cw_bytes = S->coeff_words * 4;
         const size_t r_bytes = (size_t)X.K * X.N * 4;
