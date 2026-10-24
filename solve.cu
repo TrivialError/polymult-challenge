@@ -853,9 +853,11 @@ struct State {
 
     Pool* pool = nullptr;
     OutputPrep* prep = nullptr;
+    bool diag_plain_copy = false;
 #if PM_DIAG
     KeepAlive* keep = nullptr;
     double submit_us = 0, wait_us = 0;
+    std::vector<double> issue_us;  // host time each input H2D was issued
 #endif
     bool profile = false;
 
@@ -1122,8 +1124,12 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
             const size_t seg = (size_t)ch.cw * L;
             u32* dst = S.h_in[P] + (size_t)ch.col0 * nrows * L;
             const u32 r1 = std::min<u32>(nrows, (u32)(t + 1) * rpt);
-            for (u32 hi = (u32)t * rpt; hi < r1; ++hi)
-                stream_copy(dst + hi * seg, src[P] + ((size_t)hi * ncols + ch.col0) * L, seg * 4);
+            for (u32 hi = (u32)t * rpt; hi < r1; ++hi) {
+                if (PM_DIAG && S.diag_plain_copy)
+                    std::memcpy(dst + hi * seg, src[P] + ((size_t)hi * ncols + ch.col0) * L, seg * 4);
+                else
+                    stream_copy(dst + hi * seg, src[P] + ((size_t)hi * ncols + ch.col0) * L, seg * 4);
+            }
             stream_fence();
         };
     };
@@ -1151,6 +1157,9 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
         }
         const auto cur = which(i);
         const auto ts0 = clock::now();
+#if PM_DIAG
+        S.issue_us.push_back(std::chrono::duration<double, std::micro>(ts0 - t0).count());
+#endif
         submit_input_chunk(S, cur.first, cur.second);
         mark();
         const auto ts1 = clock::now();
@@ -1217,6 +1226,13 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
         d.push_back(S.submit_us);
         d.push_back(S.wait_us);
         S.submit_us = S.wait_us = 0;
+        // Per input chunk: host issue time, then GPU H2D done (both us from start).
+        d.push_back(-9);
+        for (size_t i = 0; i < S.issue_us.size(); ++i) {
+            d.push_back(S.issue_us[i]);
+            d.push_back(el(S.ev_in[i]));
+        }
+        S.issue_us.clear();
     }
 #endif
     if (S.profile) {
@@ -1470,7 +1486,8 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 #if PM_DIAG
     static int kcalls = 0;
     S->keep->set(false);
-    const bool kept = (kcalls++ % 2) == 1;  // was the GPU kept awake before this call
+    const bool kept = false;
+    S->diag_plain_copy = (kcalls++ % 2) == 1;  // alternate staging copy: plain memcpy on odd calls
     const auto tk = std::chrono::steady_clock::now();
 #endif
     out.c.data = S->prep->take();
@@ -1488,8 +1505,7 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         static int calls = 0;
         char buf[48];
         std::string head;
-        S->keep->set(!kept);  // alternate: awake before every other call
-        std::snprintf(buf, sizeof buf, "R%d%s ", calls, kept ? "k" : "");
+        std::snprintf(buf, sizeof buf, "R%d%s ", calls, S->diag_plain_copy ? "m" : (kept ? "k" : ""));
         head = buf;
         std::snprintf(buf, sizeof buf, "%.0f ", take_us);
         head += buf;
@@ -1502,7 +1518,8 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
             std::snprintf(buf, sizeof buf, "%.0f ", v);
             text += buf;
         }
-        const size_t slice = 190 - head.size() - 12, nslices = (text.size() + slice - 1) / slice;
+        const size_t room = head.size() + 12 < 190 ? 190 - head.size() - 12 : 8;
+        const size_t slice = room, nslices = (text.size() + slice - 1) / slice;
         const size_t k = (size_t)(calls++) % nslices;
         std::snprintf(buf, sizeof buf, "| D%zu/%zu ", k, nslices);
         throw std::runtime_error(head + buf + text.substr(k * slice, slice));

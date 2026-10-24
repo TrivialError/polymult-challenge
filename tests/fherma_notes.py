@@ -20,14 +20,21 @@ def main(run_id):
     api = Api(config.load())
     run = api._request("GET", "/runs/%s" % run_id)["run"]
     slices, total = {}, 0
-    print("per call (k = GPU kept awake before it): take, stage0, H2D first, H2D last, input computed, fused, "
+    print("per call (m = plain memcpy staging): take, stage0, H2D first, H2D last, input computed, fused, "
           "CRT first, D2H first, D2H last, host submit done, host end, host in submits, host waiting staging (us)")
     for p in run["points"]:
         for c in p["cases"]:
             note = c.get("note") or ""
-            r = re.match(r"R(\d+k?) ([^|]*)\|", note)
+            r = re.match(r"R(\d+[km]?) ([^|]*)", note)
             if r:
-                print("   call %-3s %s" % (r.group(1), r.group(2).strip()))
+                body = r.group(2).strip()
+                if " -9 " in " " + body + " ":
+                    head, _, per = body.partition("-9")
+                    v = [float(x) for x in per.split()]
+                    print("   call %-4s %s" % (r.group(1), head.strip()))
+                    print("        chunk issue->done (us):", " ".join("%d>%d" % (v[i], v[i + 1]) for i in range(0, len(v) - 1, 2)))
+                else:
+                    print("   call %-4s %s" % (r.group(1), body))
             m = re.search(r"D(\d+)/(\d+) (.*)", note, re.S)
             if m:
                 slices[int(m.group(1))] = m.group(3)
