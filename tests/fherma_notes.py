@@ -19,10 +19,16 @@ from diag_decode import NAMES  # noqa: E402
 def main(run_id):
     api = Api(config.load())
     run = api._request("GET", "/runs/%s" % run_id)["run"]
-    slices = {}
+    slices, total = {}, 0
+    print("per call: take, stage0, H2D first, H2D last, input computed, fused, CRT first, "
+          "D2H first, D2H last, host submit done, host end (us)")
     for p in run["points"]:
         for c in p["cases"]:
-            m = re.match(r"D(\d+)/(\d+) (.*)", c.get("note") or "", re.S)
+            note = c.get("note") or ""
+            r = re.match(r"R(\d+) ([^|]*)\|", note)
+            if r:
+                print("   call %-3s %s" % (r.group(1), r.group(2).strip()))
+            m = re.search(r"D(\d+)/(\d+) (.*)", note, re.S)
             if m:
                 slices[int(m.group(1))] = m.group(3)
                 total = int(m.group(2))

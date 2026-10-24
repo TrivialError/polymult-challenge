@@ -15,7 +15,7 @@ NAMES = {
                                         "col inv 1/16", "crt 1/16", "col inv 1/64", "crt 1/64"]),
     -107: ("register / zero-copy (us)", ["cudaHostRegister 1 poly", "H2D from registered", "cudaHostUnregister",
                                          "kernel write pinned 1 poly", "kernel read pinned 1 poly"]),
-    -105: ("whole multiply in setup, host (us)", None),
+    -105: ("whole multiply in setup: 3 back to back, 3 after 30 ms idle (us)", None),
     -106: ("DMA under host-copy load (us)", ["memcpy x32: DMA", "memcpy x32: copy", "memcpy x6: DMA", "memcpy x6: copy",
                                              "stream x32: DMA", "stream x32: copy", "stream x6: DMA", "stream x6: copy",
                                              "stream gather alone", "stream scatter alone"]),

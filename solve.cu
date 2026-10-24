@@ -82,8 +82,8 @@ namespace {
 // Device side
 // ---------------------------------------------------------------------------
 
-constexpr int DEC_TN = 16;   // coefficients per decomposition block
-constexpr int CRT_TN = 16;   // coefficients per CRT block
+constexpr int DEC_TN = 32;   // coefficients per decomposition block
+constexpr int CRT_TN = 32;   // coefficients per CRT block
 constexpr int COL_TC_MAX = 8;
 
 #if PM_DIAG
@@ -113,7 +113,7 @@ struct Ctx {
     const u32* tsmall;  // [K][TS]          tw(k) for k < TS = max(nrows, ncols)
     const u32* trow;    // [K][w2][nrows]   tw(2^s + hi 2^(s-w1)), s = w1 + index
     const u32* cdec;    // [2L][KP] 2^(16h+32) mod p
-    const u32* Qh;      // [K][HP] 16-bit halves of (M/p_j) mod q
+    const uint16_t* Qh; // [K][HP] 16-bit halves of (M/p_j) mod q
     const u32* T;       // [K+1][L] (-v M) mod q
     const u32* q;       // [L]
 };
@@ -147,11 +147,15 @@ __device__ __forceinline__ u32 chunk_to_n(const Ctx& X, int col0, int cw, int po
 // Residues of one input column chunk: R[j][n] = a_n mod p_j.
 // a_n = sum_h half_h 2^(16h); with cdec = 2^(16h+32) mod p the 64-bit dot
 // product stays < 2L 2^16 p < p 2^32, so one REDC finishes it.
+// A GEMM [coefficients x halves] x [halves x primes]: each thread owns 8
+// coefficients x 4 primes; the cdec table is copied to shared memory when it
+// fits (tab_in_smem), so the inner loop only touches shared memory.
 __global__ void k_decompose(Ctx X, const u32* __restrict__ in, u32* __restrict__ R,
-                            int col0, int cw) {
+                            int col0, int cw, int tab_in_smem) {
     DECLARE_SMEM;
-    u32* sh = reinterpret_cast<u32*>(smem_raw);  // [2L][DEC_TN]
-    const int L = X.L, H = 2 * L;
+    const int L = X.L, H = 2 * L, KP4 = X.KP / 4;
+    u32* tab_s = reinterpret_cast<u32*>(smem_raw);                             // [2L][KP] if in smem
+    uint16_t* sa = reinterpret_cast<uint16_t*>(tab_s + (tab_in_smem ? H * X.KP : 0));  // [2L][DEC_TN]
     const int pos0 = (int)blockIdx.x * DEC_TN;
     const int cnt = imin(DEC_TN, (int)X.nrows * cw - pos0);
     const u32* src = in + (size_t)pos0 * L;
@@ -159,32 +163,37 @@ __global__ void k_decompose(Ctx X, const u32* __restrict__ in, u32* __restrict__
     FOR_THREADS(idx, DEC_TN * L) {
         const int pos = idx / L, l = idx - pos * L;
         const u32 v = pos < cnt ? src[idx] : 0u;
-        sh[(2 * l) * DEC_TN + pos] = v & 0xFFFFu;
-        sh[(2 * l + 1) * DEC_TN + pos] = v >> 16;
+        sa[(2 * l) * DEC_TN + pos] = (uint16_t)(v & 0xFFFFu);
+        sa[(2 * l + 1) * DEC_TN + pos] = (uint16_t)(v >> 16);
+    }
+    if (tab_in_smem) {
+        FOR_THREADS(idx, H * KP4)
+            reinterpret_cast<uint4*>(tab_s)[idx] = reinterpret_cast<const uint4*>(X.cdec)[idx];
     }
     __syncthreads();
 
-    // Micro-tile: 2 coefficients x 4 primes per thread.
-    constexpr int ngroups = DEC_TN / 2;
-    FOR_THREADS(task, ngroups * (X.KP / 4)) {
+    const uint4* tab = reinterpret_cast<const uint4*>(tab_in_smem ? tab_s : X.cdec);
+    constexpr int ngroups = DEC_TN / 8;
+    FOR_THREADS(task, ngroups * KP4) {
         const int ng = task % ngroups, jg = task / ngroups;
-        u64 acc[2][4];
-        for (int x = 0; x < 2; ++x)
+        u64 acc[8][4];
+        for (int x = 0; x < 8; ++x)
             for (int y = 0; y < 4; ++y) acc[x][y] = 0;
-        const uint4* cd = reinterpret_cast<const uint4*>(X.cdec) + jg;
         for (int h = 0; h < H; ++h) {
-            const uint2 a2 = *reinterpret_cast<const uint2*>(sh + h * DEC_TN + 2 * ng);
-            const uint4 c4 = cd[h * (X.KP / 4)];
-            const u32 av[2] = {a2.x, a2.y}, cv[4] = {c4.x, c4.y, c4.z, c4.w};
-            for (int x = 0; x < 2; ++x)
+            const uint4 a8 = *reinterpret_cast<const uint4*>(sa + h * DEC_TN + 8 * ng);
+            const uint4 c4 = tab[h * KP4 + jg];
+            const u32 av[8] = {a8.x & 0xFFFFu, a8.x >> 16, a8.y & 0xFFFFu, a8.y >> 16,
+                               a8.z & 0xFFFFu, a8.z >> 16, a8.w & 0xFFFFu, a8.w >> 16};
+            const u32 cv[4] = {c4.x, c4.y, c4.z, c4.w};
+            for (int x = 0; x < 8; ++x)
                 for (int y = 0; y < 4; ++y) acc[x][y] += (u64)av[x] * cv[y];
         }
         for (int y = 0; y < 4; ++y) {
             const int j = 4 * jg + y;
             if (j >= X.K) continue;
             const u32 p = X.p[j], pinv = X.pinv[j];
-            for (int x = 0; x < 2; ++x) {
-                const int pos = 2 * ng + x;
+            for (int x = 0; x < 8; ++x) {
+                const int pos = 8 * ng + x;
                 if (pos >= cnt) continue;
                 R[(size_t)j * X.N + chunk_to_n(X, col0, cw, pos0 + pos)] = redc(acc[x][y], p, pinv);
             }
@@ -338,13 +347,19 @@ __global__ void k_row_fused(Ctx X, u32* __restrict__ RB, const u32* __restrict__
 }
 
 // CRT of one output column chunk, straight into the output limb layout.
-__global__ void k_crt(Ctx X, const u32* __restrict__ R, u32* __restrict__ out, int col0, int cw) {
+// The sum over primes is a GEMM [coefficients x primes] x [primes x halves]:
+// each thread owns 8 coefficients x 4 halves; the 16-bit Qh table is copied to
+// shared memory when it fits (tab_in_smem).
+__global__ void k_crt(Ctx X, const u32* __restrict__ R, u32* __restrict__ out, int col0, int cw,
+                      int tab_in_smem) {
     DECLARE_SMEM;
     const int K = X.K, KP = X.KP, L = X.L, HP = X.HP, ZL = X.ZL;
-    u64* sh_acc = reinterpret_cast<u64*>(smem_raw);           // [CRT_TN][HP]
-    u32* sh_y = reinterpret_cast<u32*>(sh_acc + CRT_TN * HP);  // [KP][CRT_TN]
-    u32* sh_z = sh_y + KP * CRT_TN;                            // [CRT_TN][ZL]
-    u32* sh_v = sh_z + CRT_TN * ZL;                            // [CRT_TN]
+    const int YW = KP > ZL ? KP : ZL;
+    u64* sh_acc = reinterpret_cast<u64*>(smem_raw);                 // [CRT_TN][HP]
+    u32* sh_y = reinterpret_cast<u32*>(sh_acc + CRT_TN * HP);        // [KP][CRT_TN]
+    u32* sh_z = sh_y;                                                // [CRT_TN][ZL], reuses y
+    u32* sh_v = sh_y + YW * CRT_TN;                                  // [CRT_TN]
+    uint16_t* tab_s = reinterpret_cast<uint16_t*>(sh_v + CRT_TN);    // [K][HP] if in smem
     const int pos0 = (int)blockIdx.x * CRT_TN;
     const int cnt = imin(CRT_TN, (int)X.nrows * cw - pos0);
 
@@ -358,6 +373,10 @@ __global__ void k_crt(Ctx X, const u32* __restrict__ R, u32* __restrict__ out, i
         }
         sh_y[idx] = val;
     }
+    if (tab_in_smem) {
+        FOR_THREADS(idx, K * HP / 4)
+            reinterpret_cast<uint2*>(tab_s)[idx] = reinterpret_cast<const uint2*>(X.Qh)[idx];
+    }
     __syncthreads();
 
     // v = round(sum y_j / p_j): the sum is within 1/8 of an integer.
@@ -367,23 +386,24 @@ __global__ void k_crt(Ctx X, const u32* __restrict__ R, u32* __restrict__ out, i
         sh_v[pos] = (u32)(s + 0.5f);
     }
     // acc[pos][h] = sum_j y_j * Qh[j][h]  (< K 2^47).
-    // Micro-tile: 2 coefficients x 4 halves per thread.
-    constexpr int ngroups = CRT_TN / 2;
+    const uint2* tab = reinterpret_cast<const uint2*>(tab_in_smem ? tab_s : X.Qh);
+    constexpr int ngroups = CRT_TN / 8;
     FOR_THREADS(task, ngroups * (HP / 4)) {
         const int ng = task % ngroups, hg = task / ngroups;
-        u64 acc[2][4];
-        for (int x = 0; x < 2; ++x)
+        u64 acc[8][4];
+        for (int x = 0; x < 8; ++x)
             for (int y = 0; y < 4; ++y) acc[x][y] = 0;
-        const uint4* qh = reinterpret_cast<const uint4*>(X.Qh) + hg;
         for (int j = 0; j < K; ++j) {
-            const uint2 y2 = *reinterpret_cast<const uint2*>(sh_y + j * CRT_TN + 2 * ng);
-            const uint4 q4 = qh[j * (HP / 4)];
-            const u32 yv[2] = {y2.x, y2.y}, qv[4] = {q4.x, q4.y, q4.z, q4.w};
-            for (int x = 0; x < 2; ++x)
+            const uint4 ya = *reinterpret_cast<const uint4*>(sh_y + j * CRT_TN + 8 * ng);
+            const uint4 yb = *reinterpret_cast<const uint4*>(sh_y + j * CRT_TN + 8 * ng + 4);
+            const uint2 q4 = tab[j * (HP / 4) + hg];
+            const u32 yv[8] = {ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w};
+            const u32 qv[4] = {q4.x & 0xFFFFu, q4.x >> 16, q4.y & 0xFFFFu, q4.y >> 16};
+            for (int x = 0; x < 8; ++x)
                 for (int y = 0; y < 4; ++y) acc[x][y] += (u64)yv[x] * qv[y];
         }
-        for (int x = 0; x < 2; ++x)
-            for (int y = 0; y < 4; ++y) sh_acc[(2 * ng + x) * HP + 4 * hg + y] = acc[x][y];
+        for (int x = 0; x < 8; ++x)
+            for (int y = 0; y < 4; ++y) sh_acc[(8 * ng + x) * HP + 4 * hg + y] = acc[x][y];
     }
     __syncthreads();
 
@@ -732,6 +752,7 @@ struct State {
     std::vector<Chunk> cin[2], cout;
     int nin = 0, rpb = 1;
     size_t dec_smem = 0, crt_smem = 0, row_smem = 0;
+    int dec_tab = 0, crt_tab = 0;  // constant tables staged in shared memory
     size_t coeff_words = 0;  // N * L
 
     std::vector<void*> dev_tables;
@@ -864,12 +885,12 @@ void precompute(State& S, const fherma::Point& pt) {
     suf[K] = pre[0];
     for (int j = 0; j < K; ++j) pre[j + 1] = big_mod(big_mul(pre[j], Big{primes[j]}), q);
     for (int j = K - 1; j >= 0; --j) suf[j] = big_mod(big_mul(suf[j + 1], Big{primes[j]}), q);
-    std::vector<u32> hQh((size_t)K * HP, 0);
+    std::vector<uint16_t> hQh((size_t)K * HP, 0);
     for (int j = 0; j < K; ++j) {
         const Big Qj = big_mod(big_mul(pre[j], suf[j + 1]), q);
         for (int l = 0; l < L; ++l) {
-            hQh[(size_t)j * HP + 2 * l] = Qj[l] & 0xFFFFu;
-            hQh[(size_t)j * HP + 2 * l + 1] = Qj[l] >> 16;
+            hQh[(size_t)j * HP + 2 * l] = (uint16_t)(Qj[l] & 0xFFFFu);
+            hQh[(size_t)j * HP + 2 * l + 1] = (uint16_t)(Qj[l] >> 16);
         }
     }
     const Big& Mq = pre[K];
@@ -935,8 +956,8 @@ void submit_input_chunk(State& S, int P, int c) {
     check(cudaEventRecord(S.ev_in[i], S.s_h2d), "record");
     check(cudaStreamWaitEvent(sc, S.ev_in[i], 0), "wait");
     const int coefs = (int)X.nrows * ch.cw;
-    LAUNCH(k_decompose, dim3((coefs + DEC_TN - 1) / DEC_TN), dim3(256), S.dec_smem, sc,
-           X, S.d_in[P] + off, S.d_R[P], ch.col0, ch.cw);
+    LAUNCH(k_decompose, dim3((coefs + DEC_TN - 1) / DEC_TN), dim3(128), S.dec_smem, sc,
+           X, S.d_in[P] + off, S.d_R[P], ch.col0, ch.cw, S.dec_tab);
     launch_col(S, false, S.d_R[P], ch.col0, ch.cw, sc);
     check(cudaEventRecord(S.ev_cin[i], sc), "record");
     if (P == 0 && c == (int)S.cin[0].size() - 1) {
@@ -960,8 +981,8 @@ void submit_output(State& S) {
         const int coefs = (int)X.nrows * ch.cw;
         if (c > 0 && c < State::NCS) check(cudaStreamWaitEvent(sc, S.ev_fused, 0), "wait");
         launch_col(S, true, S.d_R[1], ch.col0, ch.cw, sc);
-        LAUNCH(k_crt, dim3((coefs + CRT_TN - 1) / CRT_TN), dim3(256), S.crt_smem, sc,
-               X, S.d_R[1], S.d_out + off, ch.col0, ch.cw);
+        LAUNCH(k_crt, dim3((coefs + CRT_TN - 1) / CRT_TN), dim3(128), S.crt_smem, sc,
+               X, S.d_R[1], S.d_out + off, ch.col0, ch.cw, S.crt_tab);
         check(cudaEventRecord(S.ev_crt[c], sc), "record");
         check(cudaStreamWaitEvent(S.s_d2h, S.ev_crt[c], 0), "wait");
         check(cudaMemcpyAsync(S.h_out + off, S.d_out + off, words * 4, cudaMemcpyDeviceToHost, S.s_d2h), "D2H");
@@ -1075,8 +1096,9 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
     mark();
 #if PM_DIAG
     {
-        // GPU timeline relative to g0 (ms -> us): input chunk H2D done,
-        // input chunk compute done, fused kernel done, CRT chunk done, D2H done.
+        // One call's summary (us from its start): host stage-0 done, H2D first
+        // and last done, last input chunk computed, fused done, first CRT
+        // done, D2H first and last done, host output-submit done, host end.
         auto el = [&](cudaEvent_t e) {
             float ms = 0;
             check(cudaEventElapsedTime(&ms, S.g0, e), "elapsed");
@@ -1084,18 +1106,19 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
         };
         std::vector<double>& d = S.drun;
         d.clear();
-        d.push_back(-1); d.push_back((double)th.size());
-        d.insert(d.end(), th.begin(), th.end());
-        d.push_back(-2); d.push_back(S.nin);
-        for (auto e : S.ev_in) d.push_back(el(e));
-        d.push_back(-3); d.push_back(S.nin);
-        for (auto e : S.ev_cin) d.push_back(el(e));
-        d.push_back(-4); d.push_back(1);
+        double cin_last = 0, crt_first = 1e30;
+        for (auto e : S.ev_cin) cin_last = std::max(cin_last, el(e));
+        for (auto e : S.ev_crt) crt_first = std::min(crt_first, el(e));
+        d.push_back(th.front());
+        d.push_back(el(S.ev_in.front()));
+        d.push_back(el(S.ev_in.back()));
+        d.push_back(cin_last);
         d.push_back(el(S.ev_fused));
-        d.push_back(-5); d.push_back((double)S.cout.size());
-        for (auto e : S.ev_crt) d.push_back(el(e));
-        d.push_back(-6); d.push_back((double)S.cout.size());
-        for (auto e : S.ev_out) d.push_back(el(e));
+        d.push_back(crt_first);
+        d.push_back(el(S.ev_out.front()));
+        d.push_back(el(S.ev_out.back()));
+        d.push_back(th[1 + 2 * S.nin]);
+        d.push_back(th.back());
     }
 #endif
     if (S.profile) {
@@ -1167,12 +1190,12 @@ void diag_setup(State& S, std::vector<u32>& pageable, std::vector<u32>& sink) {
     // 16-column and a 4-column output chunk.
     d.push_back(-104); d.push_back(8);
     auto decomp = [&](int cw) {
-        LAUNCH(k_decompose, dim3((X.nrows * cw + DEC_TN - 1) / DEC_TN), dim3(256), S.dec_smem, S.s_comp,
-               X, S.d_in[0], S.d_R[0], 0, cw);
+        LAUNCH(k_decompose, dim3((X.nrows * cw + DEC_TN - 1) / DEC_TN), dim3(128), S.dec_smem, S.s_comp,
+               X, S.d_in[0], S.d_R[0], 0, cw, S.dec_tab);
     };
     auto crt = [&](int cw) {
-        LAUNCH(k_crt, dim3((X.nrows * cw + CRT_TN - 1) / CRT_TN), dim3(256), S.crt_smem, S.s_comp,
-               X, S.d_R[1], S.d_out, 0, cw);
+        LAUNCH(k_crt, dim3((X.nrows * cw + CRT_TN - 1) / CRT_TN), dim3(128), S.crt_smem, S.s_comp,
+               X, S.d_R[1], S.d_out, 0, cw, S.crt_tab);
     };
     const int cwi = std::max(1, (int)X.ncols / 8), cwo = std::max(1, (int)X.ncols / 16), cws = std::max(1, (int)X.ncols / 64);
     d.push_back(gpu_us(S.s_comp, [&] { decomp(cwi); }));
@@ -1208,8 +1231,10 @@ void diag_setup(State& S, std::vector<u32>& pageable, std::vector<u32>& sink) {
         check(cudaGetLastError(), "zero copy");
     }
 
-    d.push_back(-105); d.push_back(5);
-    for (int rep = 0; rep < 5; ++rep) {
+    // Whole multiply back to back, then each after 30 ms idle.
+    d.push_back(-105); d.push_back(6);
+    for (int rep = 0; rep < 6; ++rep) {
+        if (rep >= 3) std::this_thread::sleep_for(std::chrono::milliseconds(30));
         auto t = clock::now();
         multiply(S, pageable.data(), pageable.data(), sink.data());
         d.push_back(host_us(t));
@@ -1264,8 +1289,16 @@ void* fherma_init(const fherma::Point& pt) {
         S->nin = (int)(S->cin[0].size() + S->cin[1].size());
         S->rpb = (int)std::min<u32>(X.nrows, std::max<u32>(1, 1024 / X.ncols));
 
-        S->dec_smem = (size_t)2 * X.L * DEC_TN * 4;
-        S->crt_smem = (size_t)CRT_TN * X.HP * 8 + (size_t)X.KP * CRT_TN * 4 + (size_t)CRT_TN * X.ZL * 4 + CRT_TN * 4;
+        // Constant tables go to shared memory when the block still fits
+        // three to an SM (~75 KB each); otherwise the GEMMs read them from L1/L2.
+        constexpr size_t kTabBudget = 75 * 1024;
+        const size_t dec_base = (size_t)2 * X.L * DEC_TN * 2, dec_tab = (size_t)2 * X.L * X.KP * 4;
+        S->dec_tab = dec_base + dec_tab <= kTabBudget;
+        S->dec_smem = dec_base + (S->dec_tab ? dec_tab : 0);
+        const size_t crt_base = (size_t)CRT_TN * X.HP * 8 + (size_t)std::max(X.KP, X.ZL) * CRT_TN * 4 + CRT_TN * 4;
+        const size_t crt_tab = (size_t)X.K * X.HP * 2;
+        S->crt_tab = crt_base + crt_tab <= kTabBudget;
+        S->crt_smem = crt_base + (S->crt_tab ? crt_tab : 0);
         S->row_smem = (size_t)S->rpb * X.ncols * 4;
         auto allow = [](auto kernel, size_t bytes) {
             if (bytes > 48 * 1024)
@@ -1330,30 +1363,41 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         throw std::runtime_error("operand size does not match N x L");
     fherma::Outputs out;
     out.c.shape = {static_cast<int64_t>(S->X.N), static_cast<int64_t>(S->X.L)};
+#if PM_DIAG
+    const auto tk = std::chrono::steady_clock::now();
+#endif
     out.c.data = S->prep->take();
+#if PM_DIAG
+    const double take_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tk).count();
+#endif
     multiply(*S, in.a.data.data(), in.b.data.data(), out.c.data.data());
     S->prep->request();
 #if PM_DIAG
     {
         // Large points keep no case files in a debug run, so the record also
         // leaves as the case's crash note: call k throws slice k of the text.
-        std::vector<double> d = S->dinit;
-        d.insert(d.end(), S->drun.begin(), S->drun.end());
-        u32* w = out.c.data.data();
-        w[0] = 0xD1A6D1A6u;
-        w[1] = (u32)d.size();
-        std::memcpy(w + 2, d.data(), d.size() * sizeof(double));
+        // The note carries this call's own summary ("R<call> ... |"), then a
+        // slice of the setup record; successive calls cycle through the slices.
+        static int calls = 0;
+        char buf[48];
+        std::string head;
+        std::snprintf(buf, sizeof buf, "R%d ", calls);
+        head = buf;
+        std::snprintf(buf, sizeof buf, "%.0f ", take_us);
+        head += buf;
+        for (double v : S->drun) {
+            std::snprintf(buf, sizeof buf, "%.0f ", v);
+            head += buf;
+        }
         std::string text;
-        char buf[32];
-        for (double v : d) {
+        for (double v : S->dinit) {
             std::snprintf(buf, sizeof buf, "%.0f ", v);
             text += buf;
         }
-        static int calls = 0;
-        const size_t slice = 180, nslices = (text.size() + slice - 1) / slice;
+        const size_t slice = 190 - head.size() - 12, nslices = (text.size() + slice - 1) / slice;
         const size_t k = (size_t)(calls++) % nslices;
-        std::snprintf(buf, sizeof buf, "D%zu/%zu ", k, nslices);
-        throw std::runtime_error(buf + text.substr(k * slice, slice));
+        std::snprintf(buf, sizeof buf, "| D%zu/%zu ", k, nslices);
+        throw std::runtime_error(head + buf + text.substr(k * slice, slice));
     }
 #endif
     return out;
