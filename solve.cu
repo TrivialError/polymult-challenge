@@ -71,7 +71,7 @@ typedef uint64_t u64;
 // micro-benchmarks are written over the start of the output (which then fails
 // verification on purpose). Never submit a PM_DIAG build to the challenge.
 #ifndef PM_DIAG
-#define PM_DIAG 0
+#define PM_DIAG 1
 #endif
 
 #define FOR_THREADS(i, n) for (int i = (int)threadIdx.x; i < (int)(n); i += (int)blockDim.x)
