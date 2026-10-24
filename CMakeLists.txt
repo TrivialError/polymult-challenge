@@ -46,9 +46,11 @@ target_include_directories(solution PRIVATE
 set_target_properties(solution PROPERTIES
   CUDA_ARCHITECTURES OFF
   CUDA_SEPARABLE_COMPILATION ON)
+# --resource-usage / -Xptxas=-v: registers, spills and shared memory per
+# kernel in the build log (ptxas runs at the device link under -dlto).
 target_compile_options(solution PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH};-dlto>)
+  $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH};-dlto;--resource-usage>)
 target_link_options(solution PRIVATE
-  $<DEVICE_LINK:-arch=${FHERMA_CUDA_ARCH};-dlto>)
+  $<DEVICE_LINK:-arch=${FHERMA_CUDA_ARCH};-dlto;-Xptxas=-v>)
 
 target_link_libraries(solution PRIVATE ${CUPQC_SDK_DIR}/lib/libcupqc-bigint.a)

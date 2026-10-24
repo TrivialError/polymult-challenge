@@ -20,12 +20,12 @@ def main(run_id):
     api = Api(config.load())
     run = api._request("GET", "/runs/%s" % run_id)["run"]
     slices, total = {}, 0
-    print("per call: take, stage0, H2D first, H2D last, input computed, fused, CRT first, "
-          "D2H first, D2H last, host submit done, host end (us)")
+    print("per call (k = GPU kept awake before it): take, stage0, H2D first, H2D last, input computed, fused, "
+          "CRT first, D2H first, D2H last, host submit done, host end, host in submits, host waiting staging (us)")
     for p in run["points"]:
         for c in p["cases"]:
             note = c.get("note") or ""
-            r = re.match(r"R(\d+) ([^|]*)\|", note)
+            r = re.match(r"R(\d+k?) ([^|]*)\|", note)
             if r:
                 print("   call %-3s %s" % (r.group(1), r.group(2).strip()))
             m = re.search(r"D(\d+)/(\d+) (.*)", note, re.S)

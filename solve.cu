@@ -288,21 +288,48 @@ __global__ void k_col(Ctx X, u32* __restrict__ R, int col0, int ltc) {
 //     tw(2^s + hi 2^ls + x) = tw(2^s + hi 2^ls) * psi^bitrev(x) = trow * tsmall,
 // one Montgomery product. The inverse index 2^s - 1 - (hi 2^ls + x) equals
 // (nrows-1-hi) 2^ls + (2^ls - 1 - x): the forward formula on the mirrored row.
-template <bool INV>
-__device__ __forceinline__ void row_passes(const Ctx& X, u32* sh, int rpb, u32 hi0, int j, u32 p, u32 pinv) {
+// The block's twiddle inputs, staged in shared memory alongside its rows:
+// ts[i] = psi^bitrev(i) for i < ncols/2, and the trow factors of the block's
+// rows (trf) and of their mirrored rows (tri), [w2][rpb] each.
+struct RowTw {
+    u32* ts;
+    u32* trf;
+    u32* tri;
+};
+
+__device__ __forceinline__ RowTw row_tw_layout(const Ctx& X, u32* base, int rpb) {
+    RowTw t;
+    t.ts = base;
+    t.trf = t.ts + ((int)X.ncols / 2 > 0 ? (int)X.ncols / 2 : 1);
+    t.tri = t.trf + X.w2 * rpb;
+    return t;
+}
+
+// Fills a RowTw; call in a load phase (before a barrier).
+__device__ __forceinline__ void row_tw_load(const Ctx& X, const RowTw& t, int rpb, u32 hi0, int j) {
     const int w2 = X.w2, nr = (int)X.nrows;
     const u32* trw = X.trow + (size_t)j * w2 * nr;
-    const u32* ts = X.tsmall + (size_t)j * X.TS;
+    FOR_THREADS(i, (int)X.ncols / 2) t.ts[i] = X.tsmall[(size_t)j * X.TS + i];
+    FOR_THREADS(idx, w2 * rpb) {
+        const int ls = idx / rpb, rr = idx - ls * rpb;
+        const int hi = (int)hi0 + rr;
+        t.trf[idx] = trw[ls * nr + hi];
+        t.tri[idx] = trw[ls * nr + (nr - 1 - hi)];
+    }
+}
+
+template <bool INV>
+__device__ __forceinline__ void row_passes(const Ctx& X, u32* sh, const RowTw& T, int rpb, u32 p, u32 pinv) {
+    const int w2 = X.w2;
     const int npass = (w2 + 2) / 3;
     for (int pi = 0; pi < npass; ++pi) {
         const int ls0 = 3 * (INV ? npass - 1 - pi : pi), r = imin(3, w2 - ls0);
         const int lg = w2 - r;  // log2 groups per row
         FOR_THREADS(t, rpb << lg) {
             const int rr = t >> lg;
-            const u32 hi = hi0 + (u32)rr;
             auto tw = [&](int ls, u32 i) {
-                return INV ? mont_mul(trw[ls * nr + (nr - 1 - (int)hi)], ts[(1u << ls) - 1u - i], p, pinv)
-                           : mont_mul(trw[ls * nr + (int)hi], ts[i], p, pinv);
+                return INV ? mont_mul(T.tri[ls * rpb + rr], T.ts[(1u << ls) - 1u - i], p, pinv)
+                           : mont_mul(T.trf[ls * rpb + rr], T.ts[i], p, pinv);
             };
             ntt_group_r<INV>(r, sh + ((size_t)rr << w2), 1, w2, ls0, t & ((1 << lg) - 1), tw, p, pinv);
         }
@@ -313,15 +340,17 @@ __device__ __forceinline__ void row_passes(const Ctx& X, u32* sh, int rpb, u32 h
 // Forward row stages of `rpb` consecutive rows of prime blockIdx.y.
 __global__ void k_row_fwd(Ctx X, u32* __restrict__ R, int rpb) {
     DECLARE_SMEM;
-    u32* sh = reinterpret_cast<u32*>(smem_raw);  // [rpb][ncols]
+    u32* sh = reinterpret_cast<u32*>(smem_raw);  // [rpb][ncols], then the twiddle inputs
+    const RowTw T = row_tw_layout(X, sh + (rpb << X.w2), rpb);
     const int j = (int)blockIdx.y;
     const u32 p = X.p[j], pinv = X.pinv[j];
     const u32 hi0 = blockIdx.x * (u32)rpb;
     u32* rows = R + (size_t)j * X.N + (size_t)hi0 * X.ncols;
 
     FOR_THREADS(idx, rpb << X.w2) sh[idx] = rows[idx];
+    row_tw_load(X, T, rpb, hi0, j);
     __syncthreads();
-    row_passes<false>(X, sh, rpb, hi0, j, p, pinv);
+    row_passes<false>(X, sh, T, rpb, p, pinv);
     FOR_THREADS(idx, rpb << X.w2) rows[idx] = sh[idx];
 }
 
@@ -330,6 +359,7 @@ __global__ void k_row_fwd(Ctx X, u32* __restrict__ R, int rpb) {
 __global__ void k_row_fused(Ctx X, u32* __restrict__ RB, const u32* __restrict__ RA, int rpb) {
     DECLARE_SMEM;
     u32* sh = reinterpret_cast<u32*>(smem_raw);
+    const RowTw T = row_tw_layout(X, sh + (rpb << X.w2), rpb);
     const int j = (int)blockIdx.y;
     const u32 p = X.p[j], pinv = X.pinv[j];
     const u32 hi0 = blockIdx.x * (u32)rpb;
@@ -338,11 +368,12 @@ __global__ void k_row_fused(Ctx X, u32* __restrict__ RB, const u32* __restrict__
     const u32* arows = RA + off;
 
     FOR_THREADS(idx, rpb << X.w2) sh[idx] = rows[idx];
+    row_tw_load(X, T, rpb, hi0, j);
     __syncthreads();
-    row_passes<false>(X, sh, rpb, hi0, j, p, pinv);
+    row_passes<false>(X, sh, T, rpb, p, pinv);
     FOR_THREADS(idx, rpb << X.w2) sh[idx] = mont_mul(sh[idx], arows[idx], p, pinv);
     __syncthreads();
-    row_passes<true>(X, sh, rpb, hi0, j, p, pinv);
+    row_passes<true>(X, sh, T, rpb, p, pinv);
     FOR_THREADS(idx, rpb << X.w2) rows[idx] = sh[idx];
 }
 
@@ -700,6 +731,57 @@ class OutputPrep {
     std::thread thread_;
 };
 
+#if PM_DIAG
+// Diagnostic only: keeps the GPU and its PCIe link out of their idle power
+// states between calls by touching them every ~200 us, to measure how much a
+// call pays for ramping up from idle. Paused (and drained) during a call.
+class KeepAlive {
+  public:
+    KeepAlive(u32* dev, u32* host) : dev_(dev), host_(host), thread_([this] { loop(); }) {}
+    ~KeepAlive() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    void set(bool on) {
+        std::unique_lock<std::mutex> lk(m_);
+        on_ = on;
+        cv_.notify_all();
+        if (!on) cv_.wait(lk, [this] { return !busy_; });
+    }
+
+  private:
+    void loop() {
+        cudaStream_t st;
+        cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            cv_.wait(lk, [this] { return on_ || stop_; });
+            if (stop_) break;
+            busy_ = true;
+            lk.unlock();
+            cudaMemcpyAsync(dev_, host_, 4096, cudaMemcpyHostToDevice, st);
+            LAUNCH(k_zc_read, dim3(1), dim3(32), 0, st, dev_, (size_t)1024, dev_);
+            cudaStreamSynchronize(st);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            lk.lock();
+            busy_ = false;
+            cv_.notify_all();
+        }
+        cudaStreamDestroy(st);
+    }
+    u32* dev_;
+    u32* host_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool on_ = false, busy_ = false, stop_ = false;
+    std::thread thread_;
+};
+#endif
+
 // Host copies between the caller's buffers and pinned staging. Non-temporal
 // stores skip the read-for-ownership of the destination, so a copy moves 2x
 // rather than 3x its size over the memory bus, which the concurrent DMA shares.
@@ -771,6 +853,10 @@ struct State {
 
     Pool* pool = nullptr;
     OutputPrep* prep = nullptr;
+#if PM_DIAG
+    KeepAlive* keep = nullptr;
+    double submit_us = 0, wait_us = 0;
+#endif
     bool profile = false;
 
     // PM_DIAG only
@@ -1064,10 +1150,19 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
             S.pool->start(&stage[(i + 1) & 1], ntasks);
         }
         const auto cur = which(i);
+        const auto ts0 = clock::now();
         submit_input_chunk(S, cur.first, cur.second);
         mark();
+        const auto ts1 = clock::now();
         if (i + 1 < total) S.pool->wait();
         mark();
+#if PM_DIAG
+        S.submit_us += std::chrono::duration<double, std::micro>(ts1 - ts0).count();
+        S.wait_us += std::chrono::duration<double, std::micro>(clock::now() - ts1).count();
+#else
+        (void)ts0;
+        (void)ts1;
+#endif
     }
     submit_output(S);
     mark();
@@ -1119,6 +1214,9 @@ void multiply(State& S, const u32* a, const u32* b, u32* out) {
         d.push_back(el(S.ev_out.back()));
         d.push_back(th[1 + 2 * S.nin]);
         d.push_back(th.back());
+        d.push_back(S.submit_us);
+        d.push_back(S.wait_us);
+        S.submit_us = S.wait_us = 0;
     }
 #endif
     if (S.profile) {
@@ -1246,6 +1344,9 @@ void diag_setup(State& S, std::vector<u32>& pageable, std::vector<u32>& sink) {
 
 void destroy(State* S) {
     if (!S) return;
+#if PM_DIAG
+    delete S->keep;
+#endif
     delete S->prep;
     delete S->pool;
     for (auto e : S->ev_in) cudaEventDestroy(e);
@@ -1299,7 +1400,7 @@ void* fherma_init(const fherma::Point& pt) {
         const size_t crt_tab = (size_t)X.K * X.HP * 2;
         S->crt_tab = crt_base + crt_tab <= kTabBudget;
         S->crt_smem = crt_base + (S->crt_tab ? crt_tab : 0);
-        S->row_smem = (size_t)S->rpb * X.ncols * 4;
+        S->row_smem = ((size_t)S->rpb * X.ncols + std::max<u32>(1, X.ncols / 2) + 2 * X.w2 * S->rpb) * 4;
         auto allow = [](auto kernel, size_t bytes) {
             if (bytes > 48 * 1024)
                 check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
@@ -1342,6 +1443,9 @@ void* fherma_init(const fherma::Point& pt) {
                          X.N, X.W, X.L, X.K, X.w1, X.w2, S->nin, (int)S->cout.size(), usable_cpus());
         S->pool = new Pool(std::max(1, std::min(12, usable_cpus() - 2)));
         S->prep = new OutputPrep(S->coeff_words);
+#if PM_DIAG
+        S->keep = new KeepAlive(S->d_out, S->h_out);
+#endif
 
         // Warm-up on zero operands: loads modules, touches every buffer.
         std::vector<u32> zeros(S->coeff_words, 0), sink(S->coeff_words);
@@ -1364,6 +1468,9 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     fherma::Outputs out;
     out.c.shape = {static_cast<int64_t>(S->X.N), static_cast<int64_t>(S->X.L)};
 #if PM_DIAG
+    static int kcalls = 0;
+    S->keep->set(false);
+    const bool kept = (kcalls++ % 2) == 1;  // was the GPU kept awake before this call
     const auto tk = std::chrono::steady_clock::now();
 #endif
     out.c.data = S->prep->take();
@@ -1381,7 +1488,8 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         static int calls = 0;
         char buf[48];
         std::string head;
-        std::snprintf(buf, sizeof buf, "R%d ", calls);
+        S->keep->set(!kept);  // alternate: awake before every other call
+        std::snprintf(buf, sizeof buf, "R%d%s ", calls, kept ? "k" : "");
         head = buf;
         std::snprintf(buf, sizeof buf, "%.0f ", take_us);
         head += buf;

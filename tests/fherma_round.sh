@@ -48,13 +48,21 @@ while True:
     except Exception as e:
         hint = str(getattr(e, "hint", ""))
         m = re.search(r"in (\d+) (minute|second)", hint)
+        if "cannot reach" in str(e):
+            time.sleep(30)
+            continue
         if not m:
             raise
         wait = int(m.group(1)) * (60 if m.group(2) == "minute" else 1) + 15
         print("cooldown %ds" % wait, flush=True)
         time.sleep(min(wait, 120))
 while True:
-    runs = [r for r in api._request("GET", base + "/runs")["items"] if r["commit"] == commit]
+    try:
+        runs = [r for r in api._request("GET", base + "/runs")["items"] if r["commit"] == commit]
+    except Exception as e:  # transient network trouble: keep polling
+        print("poll failed:", e, flush=True)
+        time.sleep(30)
+        continue
     if runs and runs[0]["status"] in ("finished", "failed", "cancelled", "lost"):
         r = runs[0]
         print("run", r["id"], r["status"], r.get("verdict"), "%s/%s" % (r.get("passed"), r.get("cases")), r.get("failure") or "")
